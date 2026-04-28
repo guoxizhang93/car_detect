@@ -36,11 +36,11 @@
 
 ### 3.1 均值负责风险判断
 
-模型对输入样本 `x` 会输出预测均值：
+模型对输入样本 `x` 会输出裁剪后的 GP 回归均值：
 
 - `mean_prediction in [0, 1]`
 
-这个值作为主要判断依据：
+这个值作为主要风险分数和判断依据。它不是经过概率校准的异常概率：
 
 - 均值越接近 `0`，越偏向正常
 - 均值越接近 `1`，越偏向卡死/脱落风险
@@ -80,7 +80,7 @@
 
 如果把均值和方差混成一个分数，会带来几个问题：
 
-- 风险定义被污染，输出不再是纯粹的“异常概率风格分数”
+- 风险定义被污染，输出不再是纯粹的“异常风险分数”
 - 模型不确定性会改变业务阈值的物理意义
 - 后续分析时难以区分“真高风险”和“模型不熟悉”
 
@@ -121,7 +121,7 @@ pip install numpy scikit-learn
 | GPU | 不支持 GPU，主要运行在 CPU | 支持 PyTorch/CUDA，可使用 GPU |
 | 工程复杂度 | 依赖少，训练/保存/部署简单 | 依赖 PyTorch/gpytorch，训练循环和设备管理更复杂 |
 | 适用规模 | 中小规模数据，精确 GP，样本增大后会明显变慢 | 更适合大规模、近似 GP、变分 GP、GPU 加速 |
-| 当前需求 | 输出均值、标准差、方差门控即可满足 | 当前未使用自定义似然、深度核、大规模近似等能力 |
+| 当前需求 | 输出回归风险分数、标准差、方差门控即可满足 | 当前未使用自定义似然、深度核、大规模近似等能力 |
 
 如果后续必须使用 GPU，建议迁移到 `gpytorch`，但需要同步改造：
 
@@ -148,12 +148,12 @@ drive_current,speed,acceleration,label
 - `drive_current`：驱动电流
 - `speed`：速度
 - `acceleration`：加速度
-- `label`：标签，`0` 表示正常，`1` 表示卡死/脱落/异常
+- `label`：二分类标签，`0` 表示正常，`1` 表示卡死/脱落/异常
 
 要求：
 
 - 所有输入特征必须是数值
-- 标签必须落在 `0~1`
+- 标签必须是 `0` 或 `1`
 - 表头名称必须和脚本参数一致
 
 ## 7. 训练流程
@@ -161,7 +161,7 @@ drive_current,speed,acceleration,label
 ### 7.1 最常用训练命令
 
 ```bash
-python tools/car_stuck_detection/gp_train_car_stuck_model.py \
+python gp_train_car_stuck_model.py \
   --csv your_data.csv \
   --model-out car_gp_model.pkl
 ```
@@ -220,7 +220,7 @@ python tools/car_stuck_detection/gp_train_car_stuck_model.py \
 如果你希望更严格地定义“可靠”，可以提高可靠区门槛，例如：
 
 ```bash
-python tools/car_stuck_detection/gp_train_car_stuck_model.py \
+python gp_train_car_stuck_model.py \
   --csv your_data.csv \
   --model-out car_gp_model.pkl \
   --variance-calibration quantile \
@@ -243,7 +243,7 @@ python tools/car_stuck_detection/gp_train_car_stuck_model.py \
 如果你已经通过历史经验或现场测试拿到了稳定阈值，可以使用手工模式：
 
 ```bash
-python tools/car_stuck_detection/gp_train_car_stuck_model.py \
+python gp_train_car_stuck_model.py \
   --csv your_data.csv \
   --model-out car_gp_model.pkl \
   --variance-calibration manual \
@@ -319,7 +319,7 @@ The returned result contains the instant GP output and, when enabled, `temporal_
 The CLI script still supports CSV for debugging and offline replay. The demo prediction CSV has 20 rows and can also simulate a real-time stream; each row represents one timestamp:
 
 ```bash
-python tools/car_stuck_detection/gp_predict_car_stuck_risk.py --model car_gp_model.pkl --input-csv tools/car_stuck_detection/gp_car_stuck_predict_demo.csv --temporal-filter --window-size 10 --high-threshold 0.7 --warning-count 4 --critical-count 7 --critical-avg-threshold 0.75
+python gp_predict_car_stuck_risk.py --model car_gp_model.pkl --input-csv gp_car_stuck_predict_demo.csv --temporal-filter --window-size 10 --high-threshold 0.7 --warning-count 4 --critical-count 7 --critical-avg-threshold 0.75
 ```
 
 For a real online service, keep one `RealTimeRiskPredictor` instance alive in the process. Do not restart the CLI script for every sample, otherwise the temporal window state is lost and latency will be unnecessarily high.
@@ -327,7 +327,7 @@ For a real online service, keep one `RealTimeRiskPredictor` instance alive in th
 ### 9.4 Show required feature order
 
 ```bash
-python tools/car_stuck_detection/gp_predict_car_stuck_risk.py --model car_gp_model.pkl --show-features
+python gp_predict_car_stuck_risk.py --model car_gp_model.pkl --show-features
 ```
 
 ## 10. 预测结果说明
@@ -342,6 +342,8 @@ python tools/car_stuck_detection/gp_predict_car_stuck_risk.py --model car_gp_mod
     "acceleration": -1.4
   },
   "mean_prediction": 0.82,
+  "score_kind": "clipped_gp_regression_mean",
+  "score_is_calibrated_probability": false,
   "variance": 0.014,
   "predicted_label_by_mean": 1,
   "decision_threshold": 0.5,
@@ -357,7 +359,8 @@ python tools/car_stuck_detection/gp_predict_car_stuck_risk.py --model car_gp_mod
 
 字段说明：
 
-- `mean_prediction`：风险主分数，越大越危险
+- `mean_prediction`：裁剪到 `0~1` 的 GP 回归风险主分数，越大越危险，但不是校准概率
+- `score_is_calibrated_probability`：当前为 `false`，表示 `mean_prediction` 不应按严格概率解释
 - `variance`：当前样本不确定性
 - `predicted_label_by_mean`：按均值阈值得到的二值判断
 - `reliability_status`：可靠性状态
@@ -366,7 +369,7 @@ python tools/car_stuck_detection/gp_predict_car_stuck_risk.py --model car_gp_mod
 推荐解释方式：
 
 - `mean_prediction` 高且 `reliable`：高风险，且结果可信
-- `mean_prediction` 高但 `review_required`：高风险趋势存在，但模型不够有把握，应复核
+- `mean_prediction` 高但 `review_required`：高风险趋势存在且模型不够有把握，应复核；若时序窗口内持续高风险，系统会进入 `critical`
 - `mean_prediction` 低且 `reliable`：可认为当前正常
 - `mean_prediction` 低但 `review_required`：不能简单认定正常，应检查数据是否超出训练分布
 
@@ -432,7 +435,8 @@ python tools/car_stuck_detection/gp_predict_car_stuck_risk.py --model car_gp_mod
 
 - 低风险且可靠：放行
 - 中高风险且可靠：报警或降级
-- 任意风险但 `review_required`：进入人工复核或备用逻辑
+- 高风险且 `review_required`：进入检查、停机或备用逻辑
+- 低风险但 `review_required`：进入人工复核或备用逻辑
 
 ### 12.4 特征顺序必须一致
 
@@ -499,7 +503,7 @@ This folder keeps three CSV files for the complete demo:
 Recommended full demo:
 
 ```bash
-python tools/car_stuck_detection/gp_train_car_stuck_model.py --csv tools/car_stuck_detection/gp_car_stuck_train_demo.csv --model-out tools/car_stuck_detection/gp_car_stuck_demo_model.pkl
-python tools/car_stuck_detection/gp_predict_car_stuck_risk.py --model tools/car_stuck_detection/gp_car_stuck_demo_model.pkl --input-csv tools/car_stuck_detection/gp_car_stuck_predict_demo.csv
-python tools/car_stuck_detection/gp_predict_car_stuck_risk.py --model tools/car_stuck_detection/gp_car_stuck_demo_model.pkl --input-csv tools/car_stuck_detection/gp_car_stuck_predict_demo.csv --temporal-filter --window-size 10
+python gp_train_car_stuck_model.py --csv gp_car_stuck_train_demo.csv --model-out gp_car_stuck_demo_model.pkl
+python gp_predict_car_stuck_risk.py --model gp_car_stuck_demo_model.pkl --input-csv gp_car_stuck_predict_demo.csv
+python gp_predict_car_stuck_risk.py --model gp_car_stuck_demo_model.pkl --input-csv gp_car_stuck_predict_demo.csv --temporal-filter --window-size 10
 ```

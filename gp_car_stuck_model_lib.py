@@ -18,6 +18,8 @@ DEFAULT_CALIBRATION_MODE = "quantile"
 DEFAULT_RELIABLE_QUANTILE = 0.50
 DEFAULT_REVIEW_QUANTILE = 0.95
 MIN_TRAIN_SAMPLES = 2
+BINARY_LABELS = {0.0, 1.0}
+REQUIRED_BINARY_LABELS = {0, 1}
 
 
 @dataclass
@@ -93,11 +95,11 @@ def build_dataset(
             label = float(row[label_name])
         except KeyError as exc:
             raise KeyError(f"CSV 缺少列: {exc}") from exc
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             raise ValueError(f"第 {index} 行存在无法转换为数值的内容: {row}") from exc
 
-        if not 0.0 <= label <= 1.0:
-            raise ValueError(f"第 {index} 行 label 超出 0~1: {label}")
+        if label not in BINARY_LABELS:
+            raise ValueError(f"第 {index} 行 label 必须是二分类 0 或 1: {label}")
 
         x_values.append(feature_row)
         y_values.append(label)
@@ -106,6 +108,16 @@ def build_dataset(
         raise ValueError(f"training data requires at least {MIN_TRAIN_SAMPLES} samples")
 
     return np.array(x_values, dtype=float), np.array(y_values, dtype=float)
+
+
+def validate_binary_class_coverage(y_data):
+    labels = set(y_data.astype(int).tolist())
+    if labels != REQUIRED_BINARY_LABELS:
+        missing = sorted(REQUIRED_BINARY_LABELS - labels)
+        raise ValueError(
+            "training data must contain both label classes 0 and 1; "
+            f"missing: {', '.join(str(label) for label in missing)}"
+        )
 
 
 def create_pipeline(feature_count: int, random_state: int):
@@ -122,7 +134,7 @@ def create_pipeline(feature_count: int, random_state: int):
 
     kernel = (
         ConstantKernel(1.0, (1e-3, 1e3))
-        * RBF(length_scale=[1.0] * feature_count, length_scale_bounds=(1e-2, 1e3))
+        * RBF(length_scale=[1.0] * feature_count, length_scale_bounds=(1e-2, 1e5))
         + WhiteKernel(noise_level=0.05, noise_level_bounds=(1e-6, 1.0))
     )
 
@@ -166,6 +178,31 @@ def validate_training_options(
         raise ValueError("variance_calibration only supports quantile or manual")
     if not 0.0 < test_size < 1.0:
         raise ValueError("test_size must be between 0 and 1")
+
+
+def validate_unit_interval(name: str, value: float):
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be between 0 and 1")
+
+
+def validate_temporal_config(config: "TemporalRiskConfig"):
+    if config.window_size <= 0:
+        raise ValueError("window_size must be greater than 0")
+    validate_unit_interval("high_threshold", config.high_threshold)
+    validate_unit_interval("critical_avg_threshold", config.critical_avg_threshold)
+    validate_unit_interval("ema_alpha", config.ema_alpha)
+    validate_unit_interval("enter_threshold", config.enter_threshold)
+    validate_unit_interval("exit_threshold", config.exit_threshold)
+    if config.enter_threshold <= config.exit_threshold:
+        raise ValueError("enter_threshold must be greater than exit_threshold")
+    if not 1 <= config.warning_count <= config.window_size:
+        raise ValueError("warning_count must be between 1 and window_size")
+    if not 1 <= config.critical_count <= config.window_size:
+        raise ValueError("critical_count must be between 1 and window_size")
+    if config.critical_count < config.warning_count:
+        raise ValueError("critical_count must be greater than or equal to warning_count")
+    if not 0 <= config.max_review_required <= config.window_size:
+        raise ValueError("max_review_required must be between 0 and window_size")
 
 
 def choose_stratify_labels(y_data, test_size: float):
@@ -230,6 +267,7 @@ def train_model(
 
     rows = read_csv_rows(csv_path)
     x_data, y_data = build_dataset(rows, features, label_name)
+    validate_binary_class_coverage(y_data)
 
     x_train, x_test, y_train, y_test = train_test_split(
         x_data,
@@ -271,6 +309,8 @@ def train_model(
         "mae": float(mean_absolute_error(y_test, pred_mean)),
         "accuracy_by_mean": float((pred_label == y_test.astype(int)).mean()),
         "mean_variance": float(pred_variance.mean()),
+        "score_kind": "clipped_gp_regression_mean",
+        "score_is_calibrated_probability": False,
         "roc_auc_by_mean": float(roc_auc_score(y_test, pred_mean)) if len(set(y_test.astype(int).tolist())) > 1 else None,
         "variance_calibration": {
             "mode": calibration_mode,
@@ -318,7 +358,7 @@ def parse_feature_payload(payload: dict, features: Sequence[str]) -> list[float]
         return [float(payload[name]) for name in features]
     except KeyError as exc:
         raise KeyError(f"输入缺少特征: {exc}") from exc
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise ValueError(f"输入特征存在非数值内容: {payload}") from exc
 
 
@@ -344,6 +384,8 @@ def predict_with_values(bundle: ModelBundle, values: Sequence[float]):
     return {
         "features": {name: float(value) for name, value in zip(bundle.features, values)},
         "mean_prediction": mean_value,
+        "score_kind": "clipped_gp_regression_mean",
+        "score_is_calibrated_probability": False,
         "variance": variance_value,
         "predicted_label_by_mean": int(mean_value >= bundle.decision_threshold),
         "decision_threshold": bundle.decision_threshold,
@@ -374,10 +416,7 @@ class TemporalRiskConfig:
 class TemporalRiskFilter:
     def __init__(self, config: TemporalRiskConfig | None = None):
         self.config = config or TemporalRiskConfig()
-        if self.config.window_size <= 0:
-            raise ValueError("window_size must be greater than 0")
-        if not 0.0 <= self.config.ema_alpha <= 1.0:
-            raise ValueError("ema_alpha must be between 0 and 1")
+        validate_temporal_config(self.config)
         self.window = deque(maxlen=self.config.window_size)
         self.smoothed_risk: float | None = None
         self.latched_high = False
@@ -411,16 +450,22 @@ class TemporalRiskFilter:
         avg_risk = sum(item["mean_prediction"] for item in self.window) / len(self.window)
         state = "normal"
         action = "run"
+        critical_reason = None
 
-        if (
+        sustained_critical_risk = (
             len(self.window) == self.config.window_size
             and high_count >= self.config.critical_count
             and avg_risk >= self.config.critical_avg_threshold
-            and review_count <= self.config.max_review_required
             and self.latched_high
-        ):
+        )
+
+        if sustained_critical_risk:
             state = "critical"
             action = "stop_or_inspect"
+            if review_count > self.config.max_review_required:
+                critical_reason = "sustained_high_risk_with_high_uncertainty"
+            else:
+                critical_reason = "sustained_high_risk"
         elif high_count >= self.config.warning_count or self.latched_high:
             state = "warning"
             action = "warn"
@@ -438,6 +483,7 @@ class TemporalRiskFilter:
             "review_required_count": int(review_count),
             "avg_risk": float(avg_risk),
             "latched_high": self.latched_high,
+            "critical_reason": critical_reason,
         }
 
 

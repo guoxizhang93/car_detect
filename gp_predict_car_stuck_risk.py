@@ -78,7 +78,7 @@ def read_csv_feature_rows(csv_path: Path, features: tuple[str, ...]) -> list[lis
         for index, row in enumerate(reader, start=2):
             try:
                 rows.append([float(row[feature]) for feature in features])
-            except ValueError as exc:
+            except (TypeError, ValueError) as exc:
                 raise ValueError(f"row {index} contains non-numeric feature values: {row}") from exc
 
     if not rows:
